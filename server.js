@@ -6,36 +6,21 @@ const path = require('path');
 const app = express();
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
-app.use(cookieParser('bi_mat_session_key')); // Chuỗi bí mật để mã hóa cookie
+app.use(cookieParser('chuoi_bi_mat_ma_hoa_cookie'));
 
-// 1. Kết nối Database (Lấy DATABASE_URL từ Environment Variables trên Render)
+// Kết nối Database trên Render (DATABASE_URL đặt trong Environment Variables)
 mongoose.connect(process.env.DATABASE_URL);
 
+// Cấu trúc Lưu trữ Key
 const KeySchema = new mongoose.Schema({
     key: { type: String, required: true, unique: true },
     isUsed: { type: Boolean, default: false },
-    createdAt: { type: Date, default: Date.now }
+    usedAt: { type: Date }
 });
 const KeyModel = mongoose.model('Key', KeySchema);
 
-// Middleware kiểm tra xem người dùng đã nhập Key thành công chưa
-const requireAuth = (req, res, next) => {
-    if (req.signedCookies.access_granted) {
-        return next(); // Cho phép truy cập nội dung
-    }
-    res.redirect('/'); // Chưa nhập Key thì đẩy về trang nhập Key
-};
-
-// 2. Trang nhập Key (Trang chủ)
-app.get('/', (req, res) => {
-    if (req.signedCookies.access_granted) {
-        return res.redirect('/dashboard'); // Đã nhập key trước đó thì vào thẳng
-    }
-    res.sendFile(path.join(__dirname, 'index.html'));
-});
-
-// 3. API xử lý khi người dùng bấm Đăng nhập Key
-app.post('/api/login', async (req, res) => {
+// API 1: Xử lý Kích hoạt Key 1 lần
+app.post('/api/verify-key', async (req, res) => {
     const { key } = req.body;
 
     if (!key) {
@@ -50,47 +35,56 @@ app.post('/api/login', async (req, res) => {
         }
 
         if (foundKey.isUsed) {
-            return res.json({ success: false, message: 'Key này đã được sử dụng!' });
+            return res.json({ success: false, message: 'Key này đã được sử dụng rồi!' });
         }
 
-        // Đánh dấu Key đã sử dụng ngay lập tức
+        // Đánh dấu Key đã dùng ngay lập tức
         foundKey.isUsed = true;
+        foundKey.usedAt = new Date();
         await foundKey.save();
 
-        // Tự động lưu Cookie đăng nhập cho máy này (Ví dụ: có hiệu lực 30 ngày)
-        res.cookie('access_granted', 'true', {
+        // Lưu Cookie xác thực cho trình duyệt người mua (hạn 30 ngày)
+        res.cookie('nova_access', 'granted', {
             signed: true,
-            maxAge: 30 * 24 * 60 * 60 * 1000, // 30 ngày
+            maxAge: 30 * 24 * 60 * 60 * 1000,
             httpOnly: true
         });
 
-        return res.json({ success: true, message: 'Xác thực thành công!' });
+        return res.json({ success: true, message: 'Kích hoạt thành công!' });
 
     } catch (err) {
         return res.status(500).json({ success: false, message: 'Lỗi máy chủ!' });
     }
 });
 
-// 4. Trang nội dung chính (Chỉ vào được sau khi nhập Key thành công)
-app.get('/dashboard', requireAuth, (req, res) => {
-    res.sendFile(path.join(__dirname, 'dashboard.html'));
+// API 2: Kiểm tra trạng thái đã nhập Key chưa khi tải trang
+app.get('/api/check-auth', (req, res) => {
+    if (req.signedCookies.nova_access === 'granted') {
+        return res.json({ authenticated: true });
+    }
+    return res.json({ authenticated: false });
 });
 
-// 5. API cho Admin thêm Key mới vào DB
-app.post('/api/admin/add-key', async (req, res) => {
-    const { adminSecret, newKey } = req.body;
-    
-    // Đặt password bảo vệ API tạo key của admin
+// API 3: Dành cho Admin tạo Key mới
+app.post('/api/admin/create-key', async (req, res) => {
+    const { adminSecret, key } = req.body;
+
     if (adminSecret !== process.env.ADMIN_SECRET) {
-        return res.status(403).json({ message: 'Không có quyền!' });
+        return res.status(403).json({ success: false, message: 'Không có quyền Admin!' });
     }
 
     try {
-        await KeyModel.create({ key: newKey });
-        res.json({ success: true, message: `Đã tạo Key: ${newKey}` });
+        await KeyModel.create({ key });
+        return res.json({ success: true, message: `Đã tạo Key: ${key}` });
     } catch (e) {
-        res.json({ success: false, message: 'Key đã tồn tại!' });
+        return res.status(400).json({ success: false, message: 'Key đã tồn tại hoặc lỗi!' });
     }
+});
+
+// Trả về file HTML chính
+app.use(express.static(path.join(__dirname, 'public')));
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
 const PORT = process.env.PORT || 3000;

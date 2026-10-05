@@ -1,85 +1,96 @@
 const express = require('express');
 const mongoose = require('mongoose');
-const cors = require('cors');
-require('dotenv').config();
+const cookieParser = require('cookie-parser');
+const path = require('path');
 
 const app = express();
 app.use(express.json());
-app.use(cors()); // Cho phép GitHub Pages gọi API
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser('bi_mat_session_key')); // Chuỗi bí mật để mã hóa cookie
 
-// Kết nối MongoDB
-mongoose.connect(process.env.MONGO_URI)
-  .then(() => console.log('MongoDB Connected!'))
-  .catch(err => console.error('MongoDB Connection Error:', err));
+// 1. Kết nối Database (Lấy DATABASE_URL từ Environment Variables trên Render)
+mongoose.connect(process.env.DATABASE_URL);
 
-// Schema quản lý License Key
 const KeySchema = new mongoose.Schema({
-  key: { type: String, required: true, unique: true },
-  hwid: { type: String, default: null },
-  createdAt: { type: Date, default: Date.now }
+    key: { type: String, required: true, unique: true },
+    isUsed: { type: Boolean, default: false },
+    createdAt: { type: Date, default: Date.now }
 });
-
 const KeyModel = mongoose.model('Key', KeySchema);
 
-// 1. API cho Admin tạo Key mới
-app.post('/api/admin/create-key', async (req, res) => {
-  const { adminSecret, customKey } = req.body;
-  
-  if (adminSecret !== process.env.ADMIN_SECRET) {
-    return res.status(403).json({ success: false, message: 'Sai mã Admin!' });
-  }
+// Middleware kiểm tra xem người dùng đã nhập Key thành công chưa
+const requireAuth = (req, res, next) => {
+    if (req.signedCookies.access_granted) {
+        return next(); // Cho phép truy cập nội dung
+    }
+    res.redirect('/'); // Chưa nhập Key thì đẩy về trang nhập Key
+};
 
-  try {
-    const newKey = customKey || 'KEY-' + Math.random().toString(36).substring(2, 10).toUpperCase();
-    const created = await KeyModel.create({ key: newKey });
-    res.json({ success: true, message: 'Tạo key thành công', key: created.key });
-  } catch (err) {
-    res.status(400).json({ success: false, message: 'Key đã tồn tại hoặc có lỗi xảy ra.' });
-  }
+// 2. Trang nhập Key (Trang chủ)
+app.get('/', (req, res) => {
+    if (req.signedCookies.access_granted) {
+        return res.redirect('/dashboard'); // Đã nhập key trước đó thì vào thẳng
+    }
+    res.sendFile(path.join(__dirname, 'index.html'));
 });
 
-// 2. API Verify Key & HWID (Cho Web hoặc Roblox Script gọi)
-app.post('/api/verify-key', async (req, res) => {
-  const { key, hwid } = req.body;
+// 3. API xử lý khi người dùng bấm Đăng nhập Key
+app.post('/api/login', async (req, res) => {
+    const { key } = req.body;
 
-  if (!key || !hwid) {
-    return res.status(400).json({ success: false, message: 'Thiếu Key hoặc HWID!' });
-  }
-
-  try {
-    const keyData = await KeyModel.findOne({ key });
-
-    if (!keyData) {
-      return res.status(404).json({ success: false, message: 'Key không tồn tại!' });
+    if (!key) {
+        return res.json({ success: false, message: 'Vui lòng nhập Key!' });
     }
 
-    // Lần đầu sử dụng -> Gán HWID cho Key
-    if (!keyData.hwid) {
-      keyData.hwid = hwid;
-      await keyData.save();
-      return res.json({ 
-        success: true, 
-        message: 'Kích hoạt Key thành công trên máy này!',
-        instructions: 'Nội dung hướng dẫn chi tiết dành cho khách hàng đã mua UI...' 
-      });
+    try {
+        const foundKey = await KeyModel.findOne({ key: key.trim() });
+
+        if (!foundKey) {
+            return res.json({ success: false, message: 'Key không tồn tại!' });
+        }
+
+        if (foundKey.isUsed) {
+            return res.json({ success: false, message: 'Key này đã được sử dụng!' });
+        }
+
+        // Đánh dấu Key đã sử dụng ngay lập tức
+        foundKey.isUsed = true;
+        await foundKey.save();
+
+        // Tự động lưu Cookie đăng nhập cho máy này (Ví dụ: có hiệu lực 30 ngày)
+        res.cookie('access_granted', 'true', {
+            signed: true,
+            maxAge: 30 * 24 * 60 * 60 * 1000, // 30 ngày
+            httpOnly: true
+        });
+
+        return res.json({ success: true, message: 'Xác thực thành công!' });
+
+    } catch (err) {
+        return res.status(500).json({ success: false, message: 'Lỗi máy chủ!' });
+    }
+});
+
+// 4. Trang nội dung chính (Chỉ vào được sau khi nhập Key thành công)
+app.get('/dashboard', requireAuth, (req, res) => {
+    res.sendFile(path.join(__dirname, 'dashboard.html'));
+});
+
+// 5. API cho Admin thêm Key mới vào DB
+app.post('/api/admin/add-key', async (req, res) => {
+    const { adminSecret, newKey } = req.body;
+    
+    // Đặt password bảo vệ API tạo key của admin
+    if (adminSecret !== process.env.ADMIN_SECRET) {
+        return res.status(403).json({ message: 'Không có quyền!' });
     }
 
-    // Đã có HWID -> So sánh với HWID gửi lên
-    if (keyData.hwid === hwid) {
-      return res.json({ 
-        success: true, 
-        message: 'Xác thực thành công!',
-        instructions: 'Nội dung hướng dẫn chi tiết dành cho khách hàng đã mua UI...' 
-      });
-    } else {
-      return res.status(403).json({ 
-        success: false, 
-        message: 'Key này đã được đăng ký cho thiết bị khác! Không thể truy cập.' 
-      });
+    try {
+        await KeyModel.create({ key: newKey });
+        res.json({ success: true, message: `Đã tạo Key: ${newKey}` });
+    } catch (e) {
+        res.json({ success: false, message: 'Key đã tồn tại!' });
     }
-  } catch (err) {
-    res.status(500).json({ success: false, message: 'Lỗi server!' });
-  }
 });
 
 const PORT = process.env.PORT || 3000;
